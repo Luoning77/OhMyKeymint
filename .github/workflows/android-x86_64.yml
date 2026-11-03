@@ -1,0 +1,82 @@
+name: Android x86_64 module
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_HUSKY_DONT_INSTALL_HOOKS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ITxiao6666/OhMyKeymint
+          ref: e9a7a98434e129ae3354bc68aab7568f993d2a51
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-linux-android
+      - uses: android-actions/setup-android@v3
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build protobuf-compiler libclang-dev golang
+          sdkmanager 'ndk;30.0.16248370'
+          cargo install bindgen-cli --locked
+      - name: Build BoringSSL for Android x86_64
+        run: |
+          git clone --depth 1 https://boringssl.googlesource.com/boringssl "$RUNNER_TEMP/boringssl"
+          git -C "$RUNNER_TEMP/boringssl" rev-parse HEAD | tee boringssl-commit.txt
+          cmake -S "$RUNNER_TEMP/boringssl" -B "$RUNNER_TEMP/boringssl/build-x86_64" -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRUST_BINDINGS=x86_64-linux-android \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_SDK_ROOT/ndk/30.0.16248370/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-26
+          cmake --build "$RUNNER_TEMP/boringssl/build-x86_64" --parallel 4
+          echo "BORINGSSL_BUILD_DIR=$RUNNER_TEMP/boringssl/build-x86_64" >> "$GITHUB_ENV"
+      - name: Configure and build module
+        run: |
+          python scripts/setup_cargo_config.py --force --ndk-root "$ANDROID_SDK_ROOT/ndk/30.0.16248370" --api-level 26 --host-tag linux-x86_64
+          python build.py --release --abi x86_64 2>&1 | tee build-x86_64.log
+      - name: Verify ZIP and every ELF payload
+        run: |
+          python - <<'PY'
+          import pathlib, zipfile, struct, hashlib
+          packages=list(pathlib.Path('.').glob('**/*x86_64*.zip'))
+          assert len(packages)==1, packages
+          p=packages[0]
+          required={'libs/x86_64/keymint','libs/x86_64/inject','zygisk/x86_64.so'}
+          with zipfile.ZipFile(p) as z:
+              assert z.testzip() is None
+              assert required <= set(z.namelist()), z.namelist()
+              elfs=[]
+              for n in z.namelist():
+                  b=z.read(n)
+                  if b[:4]==b'\x7fELF':
+                      assert b[4:6]==b'\x02\x01', n
+                      assert struct.unpack_from('<H', b, 18)[0]==62, n
+                      elfs.append(n)
+                      print('Verified ELF64 little-endian x86_64:', n)
+              assert required <= set(elfs), elfs
+          print('SHA256',hashlib.sha256(p.read_bytes()).hexdigest(),p)
+          pathlib.Path('verified').mkdir(exist_ok=True)
+          import shutil
+          shutil.copy2(p,'verified/'+p.name)
+          PY
+          mkdir -p inspect
+          unzip -q verified/*.zip -d inspect
+          for f in inspect/libs/x86_64/keymint inspect/libs/x86_64/inject inspect/zygisk/x86_64.so; do
+            "$ANDROID_SDK_ROOT/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h -l -d -n "$f"
+          done | tee elf-report.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OhMyKeymint-Android-x86_64
+          path: |
+            verified/*.zip
+            build-x86_64.log
+            elf-report.txt
+            boringssl-commit.txt
+          if-no-files-found: warn
