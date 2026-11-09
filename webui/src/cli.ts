@@ -50,6 +50,12 @@ export type PifFingerprintState = {
 
 export type KeyboxSource = 'google_hardware' | 'google_remote' | 'unknown'
 export type KeyboxLevel = 'tee' | 'strongbox' | 'unknown'
+export interface SoterIdentityState {
+  version: number
+  enabled: boolean
+  identities: { id: string, name: string, cpu_id: string }[]
+  apps: Record<string, { identity: string, cpu_id: string }>
+}
 export type PlayIntegrityStatus = 'not_checked'
 export type KeyboxRevocationStatus =
   | 'not_checked'
@@ -478,6 +484,37 @@ function parseSupportedAbi(output: string): SupportedAbi | null {
 }
 
 export class Cli {
+  async getSoterLocal(): Promise<SoterIdentityState> {
+    const { keymint } = await this.#getHelperPaths()
+    return this.#parseSoterLocal(await this.#run(keymint, ['--webui-get-soter-local'], 256 * 1024))
+  }
+
+  async changeSoterLocal(change: { action: 'enabled', enabled: boolean }
+    | { action: 'remove', id: string }
+    | { action: 'add', name: string }
+    | { action: 'apps', targets: string[], identity: string }
+    | { action: 'app', target: string, identity: string | null, cpu_id: string }): Promise<SoterIdentityState> {
+    const encoded = encodeBase64Utf8(JSON.stringify(change))
+    if (encoded.length > 120 * 1024) throw new Error('SOTER request exceeds the command size limit')
+    const { keymint } = await this.#getHelperPaths()
+    return this.#parseSoterLocal(await this.#run(keymint,
+      ['--webui-set-soter-local-base64', encoded], 256 * 1024))
+  }
+
+  #parseSoterLocal(output: string): SoterIdentityState {
+    const state = parseCanonicalJson(output, 'local SOTER')
+    if (!isRecord(state) || state.version !== 1 || typeof state.enabled !== 'boolean'
+        || !Array.isArray(state.identities) || state.identities.length > 32 || !isRecord(state.apps)
+        || !state.identities.every(item => isRecord(item) && typeof item.id === 'string'
+          && /^[a-f0-9]{32}$/.test(item.id) && typeof item.name === 'string'
+          && typeof item.cpu_id === 'string' && /^(?:[a-f0-9]{32}|[a-f0-9]{36})$/.test(item.cpu_id))
+        || !Object.entries(state.apps).every(([key, app]) => {
+          const target = parseScoopTarget(key)
+          return target?.kind === 'package-user' && isRecord(app)
+            && typeof app.identity === 'string' && typeof app.cpu_id === 'string'
+        })) throw new Error('Invalid local SOTER identity response')
+    return state as unknown as SoterIdentityState
+  }
   #helperPaths: Promise<HelperPaths> | null = null
 
   async clearGmsCache(): Promise<void> {
@@ -498,12 +535,19 @@ export class Cli {
     if (output !== 'rkp_tool_completed') throw new Error('OMK returned an unexpected RKP tool result')
   }
 
-  async issueRkpKeybox(protocol: RkpProtocol = 'auto'): Promise<RkpIssuedArtifact> {
+  async issueRkpKeybox(protocol: RkpProtocol = 'auto', includeFingerprint = false, fingerprint = ''): Promise<RkpIssuedArtifact> {
     if (!['auto', 'v1', 'v2', 'v1-native'].includes(protocol)) throw new Error('Invalid RKP protocol')
+    const value = fingerprint.trim()
+    if (typeof includeFingerprint !== 'boolean' || new TextEncoder().encode(value).length > 1024 || /[\x00-\x1f\x7f-\x9f]/u.test(value)) {
+      throw new Error('Invalid RKP build fingerprint')
+    }
+    const args = ['--webui-rkp-issue', '--confirm-issuance', protocol]
+    if (includeFingerprint) args.push('--include-fingerprint')
+    if (value) args.push('--fingerprint-base64', encodeBase64Utf8(value))
     const { keymint } = await this.#getHelperPaths()
     const output = await this.#run(
       keymint,
-      ['--webui-rkp-issue', '--confirm-issuance', protocol],
+      args,
       MAX_RKP_ISSUED_JSON_BYTES,
     )
     return parseRkpIssuedArtifact(parseCanonicalJson(output, 'issued RKP metadata'))

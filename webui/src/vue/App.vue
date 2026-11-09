@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import {
   MiuixDialog,
   MiuixRadioButtonPreference,
+  MiuixSwitchPreference,
   MiuixIcon,
   MiuixButton,
   MiuixNavigationBar,
@@ -15,7 +16,6 @@ import { afterPaint, AppList, type AppListSnapshot } from '../app_list/app_list'
 import {
   Cli,
   type DiagnosticsState,
-  type KeyboxInspector,
   type KeyboxRevocationStatus,
   type RkpIssuedArtifact,
   type RkpProtocol,
@@ -29,6 +29,7 @@ import { isDev } from '../utils/dev'
 import HomeView, { type KeyboxStatus, type ModuleStatus, type TeeStatus } from './HomeView.vue'
 import PifFingerprintDialog from './PifFingerprintDialog.vue'
 import SettingsView from './SettingsView.vue'
+import SoterIdentityDialog from './SoterIdentityDialog.vue'
 import TargetsView from './TargetsView.vue'
 import ToolsView, { type ToolEvent } from './ToolsView.vue'
 import FileBrowserSheet from './FileBrowserSheet.vue'
@@ -46,6 +47,10 @@ const pageDirection = ref(1)
 const pageScrollPositions = [0, 0, 0]
 const targetsOpen = ref(false)
 const targetsLoading = ref(false)
+const targetsSaving = ref(false)
+const targetsSaveError = ref(false)
+let targetsSavePromise: Promise<boolean> | null = null
+let targetsSaveRequested = false
 const targetsRefreshing = ref(false)
 const snapshot = shallowRef<AppListSnapshot>(appList.getSnapshot())
 const moduleStatus = ref<ModuleStatus>('loading')
@@ -53,7 +58,6 @@ const keyboxStatus = ref<KeyboxStatus>('loading')
 const keyboxSource = ref<'google_hardware' | 'google_remote' | 'unknown'>('unknown')
 const keyboxLevel = ref<'tee' | 'strongbox' | 'unknown'>('unknown')
 const keyboxRevocation = ref<KeyboxRevocationStatus>('not_checked')
-const keyboxInspector = shallowRef<KeyboxInspector | null>(null)
 const diagnostics = shallowRef<DiagnosticsState | null>(null)
 const diagnosticsStatus = ref<'loading' | 'ready' | 'error'>('loading')
 const teeStatus = ref<TeeStatus>('loading')
@@ -69,6 +73,8 @@ const rkpIssueConfirmOpen = ref(false)
 const rkpImportConfirmOpen = ref(false)
 const rkpIssueBusy = ref(false)
 const rkpProtocol = ref<RkpProtocol>('auto')
+const rkpIncludeFingerprint = ref(false)
+const rkpFingerprint = ref('')
 const rkpProtocols: RkpProtocol[] = ['auto', 'v2', 'v1', 'v1-native']
 const rkpListBusy = ref(false)
 const rkpIssuanceBusy = computed(() => rkpIssueBusy.value || rkpListBusy.value)
@@ -76,11 +82,14 @@ const rkpIssueError = ref('')
 const rkpIssuedArtifacts = ref<RkpIssuedArtifact[]>([])
 const pendingRkpImport = ref<RkpIssuedArtifact | null>(null)
 const pifOpen = ref(false)
+const soterLocalOpen = ref(false)
+const soterLocalDialog = ref<InstanceType<typeof SoterIdentityDialog> | null>(null)
 const keyboxOpen = ref(false)
 const selectedKeybox = ref<{ name: string, contents: Uint8Array } | null>(null)
 const keyboxBusy = ref(false)
 const targetsView = ref<InstanceType<typeof TargetsView> | null>(null)
 const settingsView = ref<InstanceType<typeof SettingsView> | null>(null)
+const toolsView = ref<InstanceType<typeof ToolsView> | null>(null)
 const pifDialog = ref<InstanceType<typeof PifFingerprintDialog> | null>(null)
 
 const pageIds = ['home', 'tools', 'settings'] as const
@@ -266,10 +275,11 @@ function scheduleTargetsRefresh(): void {
   if (!targetsOpen.value
       || document.visibilityState !== 'visible'
       || targetsLoading.value
+      || targetsSaving.value
       || targetsRefreshTimer !== null) return
   targetsRefreshTimer = window.setTimeout(() => {
     targetsRefreshTimer = null
-    if (targetsOpen.value && document.visibilityState === 'visible' && !targetsLoading.value) {
+    if (targetsOpen.value && document.visibilityState === 'visible' && !targetsLoading.value && !targetsSaving.value) {
       void reloadApps()
     }
   }, 180)
@@ -296,6 +306,21 @@ function onSettingsOverlayOpen(): void {
   })
 }
 
+function onToolsOverlayOpen(): void {
+  const key = 'tools-overlay'
+  if (overlayHistory.has(key)) return
+  overlayHistory.add(key)
+  history.push(key, () => {
+    overlayHistory.delete(key)
+    toolsView.value?.dismissOverlay()
+  })
+}
+
+function onToolsOverlayClose(): void {
+  const key = 'tools-overlay'
+  if (overlayHistory.delete(key)) history.consume(key)
+}
+
 function onSettingsOverlayClose(): void {
   const key = 'settings-overlay'
   if (overlayHistory.delete(key)) history.consume(key)
@@ -307,13 +332,14 @@ function onTargetsOverlayClose(): void {
 }
 
 function handleEscape(): void {
+  if (soterLocalOpen.value) { soterLocalDialog.value?.requestClose(); return }
   if (rkpIssueOpen.value && rkpIssueBusy.value) return
   if (targetsOpen.value && targetsView.value?.dismissOverlay()) return
   if (history.size > 0) history.back()
 }
 
 async function reloadApps(): Promise<void> {
-  if (targetsLoading.value) return
+  if (targetsLoading.value || targetsSaving.value) return
   targetsRefreshing.value = appList.getEntries().length > 0
   targetsLoading.value = true
   try {
@@ -333,20 +359,34 @@ async function reloadApps(): Promise<void> {
   }
 }
 
-async function saveTargets(): Promise<void> {
-  if (targetsLoading.value) return
-  targetsLoading.value = true
-  try {
-    await afterPaint()
-    await appList.save()
-    snapshot.value = appList.getSnapshot()
-    notify(i18n.t('prompt_saved_target'))
-  } catch (error) {
-    console.error('Unable to save OMK targets:', error)
-    notify(i18n.t('prompt_save_error'), true)
-  } finally {
-    targetsLoading.value = false
-  }
+function saveTargets(): Promise<boolean> {
+  if (targetsLoading.value || !config.isWritable) return Promise.resolve(false)
+  targetsSaveRequested = true
+  targetsSaveError.value = false
+  if (targetsSavePromise) return targetsSavePromise
+  targetsSaving.value = true
+  // Assign the promise before starting work so immediate callers share the queue.
+  targetsSavePromise = Promise.resolve().then(async () => {
+    try {
+      do {
+        targetsSaveRequested = false
+        await afterPaint()
+        await appList.save()
+        snapshot.value = appList.getSnapshot()
+      } while (targetsSaveRequested)
+      return true
+    } catch (error) {
+      targetsSaveRequested = false
+      targetsSaveError.value = true
+      console.error('Unable to save OMK targets:', error)
+      notify(i18n.t('prompt_save_error'), true)
+      return false
+    } finally {
+      targetsSaving.value = false
+      targetsSavePromise = null
+    }
+  })
+  return targetsSavePromise
 }
 
 async function refreshIdentity(force = false): Promise<void> {
@@ -358,25 +398,6 @@ async function refreshIdentity(force = false): Promise<void> {
     keyboxSource.value = 'google_remote'
     keyboxLevel.value = 'tee'
     keyboxRevocation.value = 'not_listed'
-    keyboxInspector.value = {
-      valid: true,
-      bundled: false,
-      rsa: null,
-      ec: {
-        algorithm: 'EC',
-        chain_length: 3,
-        serials: ['01', '02', '03'],
-        leaf_subject: 'CN=Demo keybox',
-        leaf_issuer: 'CN=Demo issuer',
-        valid_from: '2026-01-01T00:00:00Z',
-        valid_until: '2036-01-01T00:00:00Z',
-        certificates: [
-          { serial: '01', subject: 'CN=Demo keybox', issuer: 'CN=Demo issuer', valid_from: '2026-01-01T00:00:00Z', valid_until: '2036-01-01T00:00:00Z' },
-          { serial: '02', subject: 'CN=Demo issuer', issuer: 'CN=Demo root', valid_from: '2025-01-01T00:00:00Z', valid_until: '2040-01-01T00:00:00Z' },
-          { serial: '03', subject: 'CN=Demo root', issuer: 'CN=Demo root', valid_from: '2024-01-01T00:00:00Z', valid_until: '2044-01-01T00:00:00Z' },
-        ],
-      },
-    }
     teeStatus.value = 'normal'
     securityPatch.value = '2026-08-01'
     spoofedDevice.value = 'Google Pixel 9 Pro'
@@ -433,11 +454,9 @@ async function refreshDiagnostics(): Promise<void> {
   }
 
   await afterPaint()
-  const [inspector, state] = await Promise.allSettled([
-    cli.getKeyboxInspector(),
+  const [state] = await Promise.allSettled([
     cli.getDiagnostics(),
   ])
-  if (inspector.status === 'fulfilled') keyboxInspector.value = inspector.value
   if (state.status === 'fulfilled') {
     diagnostics.value = state.value
     diagnosticsStatus.value = 'ready'
@@ -575,7 +594,7 @@ async function issueRkpKeybox(): Promise<void> {
       rkpIssueConfirmOpen.value = false
       return
     }
-    const artifact = await cli.issueRkpKeybox(rkpProtocol.value)
+    const artifact = await cli.issueRkpKeybox(rkpProtocol.value, rkpIncludeFingerprint.value, rkpFingerprint.value)
     rkpIssuedArtifacts.value = [artifact, ...rkpIssuedArtifacts.value.filter(item => item.id !== artifact.id)]
     notify(i18n.t('rkp_issue_completed'))
     rkpIssueConfirmOpen.value = false
@@ -635,10 +654,13 @@ function onTool(event: ToolEvent): void {
     case 'clearGmsCache': gmsConfirmOpen.value = true; break
     case 'repairRkp': rkpError.value = ''; rkpOpen.value = true; break
     case 'issueRkp': void openRkpIssue(); break
+    case 'openSoterLocal': soterLocalOpen.value = true; break
   }
 }
 
 onMounted(async () => {
+  pageScroller.addEventListener('scroll', onPageScroll, { passive: true })
+  updateTitleCollapse()
   navigationElement = document.querySelector<HTMLElement>('.main-navigation')
   navigationElement?.style.setProperty('--omk-liquid-nav-index', String(pageIndex.value))
   navigationElement?.style.setProperty('--omk-liquid-nav-scale', '1')
@@ -671,6 +693,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  pageScroller.removeEventListener('scroll', onPageScroll)
+  if (titleCollapseFrame !== 0) cancelAnimationFrame(titleCollapseFrame)
   if (navigationFrame !== null) window.cancelAnimationFrame(navigationFrame)
   navigationFrame = null
   if (targetsRefreshTimer !== null) {
@@ -691,12 +715,31 @@ onBeforeUnmount(() => {
   history.destroy()
 })
 
+// Drive the MIUIX large-title collapse from the shared page scroller.
+const TITLE_COLLAPSE_DISTANCE = 48
+let titleCollapseFrame = 0
+let titleCollapseValue = -1
+
+function updateTitleCollapse(): void {
+  titleCollapseFrame = 0
+  const value = Math.min(1, Math.max(0, pageScroller.scrollTop / TITLE_COLLAPSE_DISTANCE))
+  const rounded = Math.round(value * 100) / 100
+  if (rounded === titleCollapseValue) return
+  titleCollapseValue = rounded
+  pageScroller.style.setProperty('--omk-title-collapse', String(rounded))
+}
+
+function onPageScroll(): void {
+  if (titleCollapseFrame === 0) titleCollapseFrame = requestAnimationFrame(updateTitleCollapse)
+}
+
 watch(pageIndex, (index, previousIndex) => {
   pageScrollPositions[previousIndex] = pageScroller.scrollTop
   pageDirection.value = index > previousIndex ? 1 : -1
   void nextTick(() => {
     if (pageIndex.value === index && !targetsOpen.value) {
       pageScroller.scrollTo(0, pageScrollPositions[index] ?? 0)
+      updateTitleCollapse()
     }
   })
   if (navigationPointerId === null) {
@@ -709,6 +752,7 @@ watch(targetsOpen, open => {
   void nextTick(() => {
     if (targetsOpen.value === open) {
       pageScroller.scrollTo(0, open ? 0 : pageScrollPositions[pageIndex.value] ?? 0)
+      updateTitleCollapse()
     }
   })
 })
@@ -721,6 +765,25 @@ watch(pifOpen, open => {
       pifDialog.value?.requestClose()
     })
   } else if (!open && overlayHistory.delete('pif-fingerprint')) history.consume('pif-fingerprint')
+})
+watch(soterLocalOpen, open => {
+  if (open && !overlayHistory.has('soter-local')) {
+    overlayHistory.add('soter-local')
+    history.push('soter-local', () => {
+      overlayHistory.delete('soter-local')
+      if (soterLocalDialog.value?.requestClose() === false) {
+        void nextTick(() => {
+          if (soterLocalOpen.value) {
+            overlayHistory.add('soter-local')
+            history.push('soter-local', () => {
+              overlayHistory.delete('soter-local')
+              soterLocalDialog.value?.requestClose()
+            })
+          }
+        })
+      }
+    })
+  } else if (!open && overlayHistory.delete('soter-local')) history.consume('soter-local')
 })
 watch(keyboxOpen, open => {
   if (open && !overlayHistory.has('keybox')) {
@@ -776,7 +839,6 @@ watch(rkpImportConfirmOpen, open => {
           :keybox-source="keyboxSource"
           :keybox-level="keyboxLevel"
           :keybox-revocation="keyboxRevocation"
-          :keybox-inspector="keyboxInspector"
           :diagnostics="diagnostics"
           :diagnostics-status="diagnosticsStatus"
           :tee-status="teeStatus"
@@ -790,7 +852,11 @@ watch(rkpImportConfirmOpen, open => {
           v-show="pageIndex === 1"
           :security-patch-busy="securityPatchBusy"
           :maintenance-busy="maintenanceBusy"
+          ref="toolsView"
           :rkp-issuance-busy="rkpIssuanceBusy"
+          :security-patch="securityPatch"
+          @overlay-open="onToolsOverlayOpen"
+          @overlay-close="onToolsOverlayClose"
           @open-app-targets="onTool('openAppTargets')"
           @install-keybox="onTool('installKeybox')"
           @sync-security-patch="onTool('syncSecurityPatch')"
@@ -799,6 +865,7 @@ watch(rkpImportConfirmOpen, open => {
           @clear-gms-cache="onTool('clearGmsCache')"
           @repair-rkp="onTool('repairRkp')"
           @issue-rkp="onTool('issueRkp')"
+          @open-soter-local="onTool('openSoterLocal')"
         />
       </Transition>
       <Transition name="page-switch">
@@ -834,11 +901,13 @@ watch(rkpImportConfirmOpen, open => {
         :app-list="appList"
         :cli="cli"
         :loading="targetsLoading"
+        :saving="targetsSaving"
+        :save-error="targetsSaveError"
         :refreshing="targetsRefreshing"
         :apply-enabled="snapshot.isWritable"
+        :save-selection="saveTargets"
         @close="closeTargets"
         @refresh="reloadApps"
-        @apply="saveTargets"
         @overlay-open="onTargetsOverlayOpen"
         @overlay-close="onTargetsOverlayClose"
       />
@@ -927,10 +996,22 @@ watch(rkpImportConfirmOpen, open => {
             :key="protocol"
             :model-value="rkpProtocol === protocol"
             :title="i18n.t(`rkp_protocol_${protocol}`)"
-            :disabled="rkpIssuanceBusy"
+            :disabled="rkpIssuanceBusy || rkpIssueConfirmOpen"
             @select="rkpProtocol = protocol"
           />
         </div>
+        <MiuixSwitchPreference
+          v-model="rkpIncludeFingerprint"
+          :title="i18n.t('rkp_include_fingerprint')"
+          :summary="i18n.t('rkp_include_fingerprint_desc')"
+          :disabled="rkpIssuanceBusy || rkpIssueConfirmOpen"
+        />
+        <label class="rkp-fingerprint-field">
+          <span>{{ i18n.t('rkp_fingerprint') }}</span>
+          <input v-model="rkpFingerprint" :disabled="rkpIssuanceBusy || rkpIssueConfirmOpen"
+            maxlength="1024" spellcheck="false" autocapitalize="none" autocomplete="off"
+            :placeholder="i18n.t('rkp_fingerprint_placeholder')">
+        </label>
         <p v-if="rkpIssueError" role="alert">{{ rkpIssueError }}</p>
         <p v-if="rkpListBusy" class="rkp-loading" role="status">
           <MiuixProgressIndicator type="circular" :size="18" />
@@ -968,6 +1049,8 @@ watch(rkpImportConfirmOpen, open => {
       <div class="confirm-sheet" :aria-busy="rkpIssueBusy">
         <p>{{ i18n.t('rkp_issue_warning') }}</p>
         <p>{{ i18n.t('rkp_protocol') }}: {{ i18n.t(`rkp_protocol_${rkpProtocol}`) }}</p>
+        <p>{{ i18n.t(rkpIncludeFingerprint ? 'rkp_include_fingerprint_on' : 'rkp_include_fingerprint_off') }}</p>
+        <p>{{ i18n.t('rkp_fingerprint') }}: {{ rkpFingerprint.trim() || i18n.t('rkp_fingerprint_placeholder') }}</p>
         <p v-if="rkpIssueError" role="alert">{{ rkpIssueError }}</p>
         <p v-if="rkpIssueBusy" role="status">{{ i18n.t('rkp_issue_running') }}</p>
         <div class="confirm-actions">
@@ -1004,5 +1087,6 @@ watch(rkpImportConfirmOpen, open => {
       </div>
     </MiuixDialog>
     <MiuixSnackbarHost />
+    <SoterIdentityDialog ref="soterLocalDialog" v-model="soterLocalOpen" :cli="cli" />
   </div>
 </template>

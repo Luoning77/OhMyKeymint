@@ -24,8 +24,8 @@ Before making a change:
 1. Make a private backup of both active files.
 2. Edit the files under `/data/misc/keystore/omk/`, not copies in the module ZIP.
 3. Keep ordinary strings inside quotes and booleans as `true` or `false`. Keep
-   the `scoop = [` and `]` lines, then add one bare package name per line;
-   those entries omit both quotes and commas.
+   the `scoop = [` and `]` lines, then add one quoted package name and comma per line;
+   package selections apply to all Android users of that package.
 4. Change one thing at a time, save the complete file, and check the matching
    log after the change.
 
@@ -83,6 +83,19 @@ Key generation and imports delete unpublished TA key blobs on a best-effort
 basis when storage or publication fails. Cleanup failure does not replace the
 original operation error.
 
+## EC signing compatibility
+
+P-256 signing keys may include redundant `Encrypt` and `Decrypt` purposes
+alongside `Sign` (and optionally `Verify`). Those purposes do not select the
+key type or enable EC encryption/decryption operations. Generation and import
+apply the same checks regardless of parameter order. This exception does not
+apply to encryption-only requests, other curves, key-agreement combinations,
+or attestation keys. Curve25519 selects signing/attestation versus agreement
+from its private-key purpose, independently of an accompanying `Verify` tag.
+
+SID, operation challenge, authentication-token MAC and authentication timeouts
+remain enforced when the key's authorization policy requires them.
+
 ## App patch-level profiles
 
 Optional `config.toml` profiles set the patch levels reported and bound into
@@ -124,9 +137,32 @@ Keybox. Open it from the Oh My Keymint module page in
 KernelSU. With Magisk, open an installed KSUWebUIStandalone or WebUI X host and
 select Oh My Keymint; the module does not install either host.
 
+The WebUI has Home, Tools, and Settings pages. Each page opens with a MIUIX
+large title that fades into the top app bar's small title over the first 48 px
+of scrolling. Home starts with a status card showing whether OMK KeyMint is
+running, its PID, or a loading or error state. Tools groups its entries into
+**App management** (package selection), **Keybox & attestation** (**Change
+Keybox**, **Remote key provisioning**, and **Local SOTER identities**), and
+**Play Integrity** (**Spoof PIF fingerprint**, **Clear GMS cache**, and
+**Security patch settings**). **Remote key provisioning** opens a bottom sheet
+with **Fix RKP** and **Issue local RKP Keybox**. **Security patch settings**
+shows the current patch date and opens a bottom sheet with **Sync security
+patch** and **Restore default security patch**. Choosing a sheet action closes
+the sheet before the action's own confirmation or panel opens. The close button,
+a downward drag, or Android Back dismisses a sheet without leaving Tools. A row
+shows a progress indicator while its action runs, and a sheet row is disabled
+only when all of its actions are busy.
+
 The main package picker shows user applications in separate **Selected package
 names** and **Unselected package names** sections. System applications,
 including Android overlays, are managed through **More > Add system apps**.
+Checking or unchecking an app saves automatically in both the main picker and
+the system-app sheet. Recommended selection and Deselect all also save
+automatically. Writes are serialized and consecutive changes are coalesced;
+clicks made during a bridge write retain their latest state for the next write.
+The page shows saving progress and an explicit unsaved error with Retry on
+failure. Failed edits remain visible for retry. Closing either picker does not
+cancel a pending save; reopening retains unsaved edits and the error state.
 Classification uses Android's package-manager list even when the WebUI host
 cannot provide an application's label or metadata. Hiding system applications
 from the main list does not remove their saved routing selections.
@@ -254,12 +290,9 @@ the registered TEE and StrongBox KeyMint services and the matching
 optional StrongBox service is shown as unregistered. These checks do not issue
 an attestation challenge, contact an RKP provisioning server, or certify
 hardware-backed operation. A vendor KeyMint process is not used as evidence
-that OMK itself is running. The Keybox inspector shows public
-certificate-chain metadata (algorithm and chain length) and each certificate's
-subject, validity dates, and serial number without exposing private
-keys or relay credentials. The expandable chain view presents the root first,
-uses the current interface language for date formatting, and keeps dates in
-UTC. A diagnostic read failure is reported in the UI and does not change runtime
+that OMK itself is running. The current-device-status card shows service state
+only, without Keybox certificate-chain details or a separate inspector request.
+A diagnostic read failure is reported in the UI and does not change runtime
 routing.
 
 The injector daemon waits for keystore2 to appear and retries injection after
@@ -477,8 +510,8 @@ version = 3
 backend = "injector"
 # KeyMint log detail: off, error, warn, info, debug, or trace.
 log_level = "debug"
-# Insecure biometric compatibility switch. Keep false for normal use.
-force_skip_system_biometric_hat_verification = false
+# Insecure biometric compatibility switch. Set false to require System MAC verification.
+force_skip_system_biometric_hat_verification = true
 # Extra random wait per software TA call: inclusive [minimum, maximum] in ms.
 # These defaults also apply when fields are absent; [0, 0] disables a category.
 ta_operation_delay_ms = [9, 21]
@@ -567,13 +600,31 @@ package names, signing-certificate bytes, challenges, tokens, or key material.
 
 This is an insecure compatibility switch for a device whose System KeyMint
 cannot verify biometric authentication tokens correctly. When `true`, OMK
-accepts a token whose structure is valid without asking System KeyMint to
-verify its authentication code.
+accepts a directly submitted, structurally valid fingerprint-only token without
+asking System KeyMint to verify its authentication code. Password, combined
+and unknown authenticator types do not receive this exception.
 
-Keep it `false` unless a maintainer is diagnosing a confirmed device-specific
-problem. It does not hide root and is not a general fix for fingerprint or
-lock-screen failures. A valid save applies to new checks without restarting
-keymint.
+The default is `true`, including when the field is omitted from `[main]`.
+An explicit `false` requires System KeyMint MAC verification for direct tokens.
+This compatibility default weakens authentication-token verification; use `false` when System
+KeyMint can verify the device's tokens. It does not hide root and is not a
+general fix for fingerprint or lock-screen failures. A valid save applies to
+new checks without restarting keymint.
+
+Tokens mirrored after successful System `addAuthToken` ingestion follow the
+separate existing mirror path regardless of this switch. A successful System
+ingestion is not itself proof of a valid hardware MAC. The switch cannot fix
+a failure in EC key creation, mirrored token delivery or key-specific SID,
+challenge, timeout and local-MAC checks.
+
+Logs distinguish `event=auth_token_received` sources (`direct` or
+`system_mirror`), `event=auth_token_verification` modes (`system_mirror`,
+`biometric_compatibility` or `system_mac`), and `event=auth_token_rejected`
+stages (`shape`, `system_mac` or `localization`). A mirror localization failure
+logs `event=auth_token_dropped stage=localization` and preserves System success.
+`event=auth_token_cached stage=localized` confirms local token
+ingestion, not a successful application signature or payment. Token ingestion
+does not log raw MACs, full challenges or secure user/authenticator IDs.
 
 #### TA delay ranges
 
@@ -974,14 +1025,14 @@ empty value is valid. Its absence does not invalidate an available IMEI.
 version = 1
 
 # Add one exact package name per line. Blank lines and lines whose first non-space character is # are ignored.
-# Bare entries omit quotes and commas; keep the surrounding scoop = [ ... ] lines.
+# Standard TOML strings with a trailing comma; plain packages apply to all users.
 scoop = [
-  io.github.vvb2060.keyattestation
-  com.google.android.gsf
-  com.google.android.gms
-  com.android.vending
-  com.eltavine.duckdetector
-  com.oplus.engineermode
+  "io.github.vvb2060.keyattestation",
+  "com.google.android.gsf",
+  "com.google.android.gms",
+  "com.android.vending",
+  "com.eltavine.duckdetector",
+  "com.oplus.engineermode",
 ]
 
 [main]
@@ -1049,11 +1100,11 @@ integers in `0..=42949`; full UIDs are in `0..=4294967295`. UID targets still
 require normal package resolution unless `allow_unknown_package` permits an
 unresolved caller; they do not override safety or deny settings.
 
-Keep the surrounding `scoop = [` and `]` lines and add one target per line,
-matching the line-oriented package list used by TrickyStore. Bare entries omit
-both quotes and commas. Empty lines and lines whose first non-space character
-is `#` are ignored, and surrounding spaces are trimmed. The traditional
-quoted, comma-separated TOML array form is also accepted. Empty entries are
+Keep the surrounding `scoop = [` and `]` lines and add one quoted target with
+a trailing comma per line, using standard TOML array syntax. The template and
+all configuration writers use this format. The reader also accepts line-based
+entries without quotes or commas for compatibility. Empty lines and comment
+lines are ignored, and surrounding spaces are trimmed. Empty entries are
 removed and decimal identifiers are canonicalized before duplicate entries are
 reduced to one when the file is loaded. A bare package and a user-specific
 target may coexist. App
@@ -1063,8 +1114,14 @@ a failed reload keeps the previous valid settings active.
 
 The embedded WebUI presents an icon, application name, package name, and
 selection control for each installed package. Multiple Android users have
-separate groups and user-specific selections. A WebUI save merges only the
-user's additions and removals into the current normalized `scoop` list;
+separate groups, but package selections apply to every user of the same package.
+Manual selection, recommended selection and system-app checkboxes automatically
+persist plain package names without user suffixes. When a selection is saved,
+existing package@user selections are converted to plain package names and
+deduplicated; explicit UID entries remain intact. Opening the picker alone
+does not migrate configuration. SOTER identity assignments remain independent
+and keep their exact package/user scope. A WebUI save merges the user's additions
+and removals into the current normalized `scoop` list;
 `[main]`, `[filter]`, `[intercept]`, and per-package tables retain their current
 values. Opening the package selector, returning to it from another app,
 pulling down at the top, or using its refresh action reloads installed packages
@@ -1081,7 +1138,7 @@ Enabling it records a baseline of installed user applications without selecting
 them. While enabled, OMK checks for new user applications in the background,
 including when the WebUI is closed. If one or more new packages appear in the
 same scan, it adds only the package whose APK has the newest installation
-timestamp as a user-specific `package@user_id` target; the other packages are
+timestamp as a plain package target without a user suffix; the other packages are
 recorded in the baseline but remain unselected. System applications are
 excluded. App updates and unchanged installed apps do not re-add a manually
 deselected target. Disabling the option leaves
@@ -1391,6 +1448,118 @@ Persistent native save paths validate the complete candidate before writing and
 use atomic replacement. Successful saves enter the applicable watcher hot-reload
 path.
 
+## Oplus engineering key-state display
+
+The existing Zygisk payload loads an app-local Java display bridge only in the
+exact com.oplus.engineermode main process. Other app-data directories and
+subprocesses are excluded. LSPlant hooks SecurityInterface.isGoogleKeyImport
+before Instrumentation.callApplicationOnCreate, using the real app ClassLoader.
+The root companion
+queries the injector's current parsed configuration for every status check.
+An explicitly selected package, package@user or UID with enabled main/filter
+and permitted system-app/deny policy returns true for this display check.
+When unselected, disabled, denied or unreadable, it invokes the original Java
+check. The companion never returns private configuration or key material.
+The local SOTER switch and PIF profiles do not control this display bridge.
+
+After specialization it obtains
+vendor.oplus.hardware.cryptoeng.ICryptoeng/default through ServiceManager.
+Only synchronous BinderProxy.transactNative code 1 calls on that exact Binder
+object, with non-null request and reply Parcels, receive a synthetic status 0
+and four zero bytes only while that same app-selection policy permits the
+override. Other Binders, methods and one-way calls retain their
+original behavior. An unavailable service leaves the application unchanged;
+JNI reply failures propagate as errors rather than reporting success.
+
+This only changes the engineering application's displayed key-state result.
+It does not repair, install or verify a hardware Attestation Key and cannot
+establish TEE health. It requires Zygisk and a new engineering-app process
+using the updated module. No new persistent state is created.
+The Java callback DEX is embedded in the bridge library and loaded
+through InMemoryDexClassLoader. libomk_engineer.so contains LSPlant and the
+pinned Dobby/LLVM C++ runtime and is loaded through the module directory FD
+before app specialization. The engineering application domain may use only its
+inherited Zygisk Unix stream via the module policy; SELinux remains enforcing.
+It changes no APK or global KeyMint validation.
+The module policy grants engineermode_app the keystore2_key gen_unique_id
+permission required by the engineering application's INCLUDE_UNIQUE_ID
+attestation test. The standard unique-ID permission gate remains intact;
+ordinary app domains do not receive this permission. Policy is installed with
+the module, independently of its app-local display override selection.
+Changing selection takes effect on the next check without reinstalling the
+bridge; installing a new bridge requires refreshing the Zygisk module image.
+Building the bridge requires NDK r30, CMake 3.28 or newer with Ninja, JDK 9 or
+newer with javac --release 8, and Android Build Tools 35.0.0. The normal Cargo
+build invokes scripts/build_engineer_bridge.py; the module packager includes
+the resulting native library and dependency licenses. Initial dependency
+downloads are checksum-verified and subsequent builds use the target cache.
+
+## Local SOTER identities
+
+Tools > Local SOTER identities manages a separate local software identity
+store. Add generates a random 16-byte-format device ID (eight leading zero
+hex characters and 24 random hex characters) and a new RSA-2048 ATTK using
+BoringSSL. Each identity has an independent ledger with per-UID ASK/AuthKey
+material, counters and sessions. No private key is returned to the WebUI.
+Fresh installations have no predefined identity. Each user creates random
+identities explicitly with Add; opening this page does not generate one.
+
+Use the app row's SOTER settings to assign an identity to one exact
+package@Android-user target, independently of KeyMint scoop selection. A
+32- or 36-character hexadecimal CPU-ID override is optional. Device ID replies
+return the decoded 16/18 bytes; ASK/AuthKey exports use the same hex value.
+Changing an app's CPU-ID clears only that caller's ASK/AuthKey and sessions
+within that identity; counters are preserved. Unselected apps use stock SOTER.
+Shared UID packages must agree on their complete identity and override policy;
+ambiguous shared UIDs are not taken over.
+
+The master switch defaults off. Turning it off retains local identities and app
+assignments, while newly observed requests use the original SOTER path.
+Configuration errors do not select another identity. Local keys are software
+keys, and CPU-ID is a SOTER protocol field, not a physical CPU modification.
+Factory ATTK provisioning operations remain native. The current local broker
+does not supply verifiable biometric evidence, so finishSign returns -26. This
+identity implementation cannot currently complete fingerprint-payment signing.
+
+The native root supervisor injects only the exact ARM64
+com.tencent.soter.soterserver process and intercepts supported vendor HAL
+requests during the selected app's Binder call. This requires a working
+Tencent service and a supported vendor AIDL/HIDL path. A saved switch or
+generated identity does not establish device support or payment acceptance.
+Private transport sockets retain the target SoterServer's SELinux MLS range
+and categories with the system_file socket type. Socket creation context is
+thread-local and restored after each operation; SELinux stays enforcing.
+
+All new SOTER data is root-owned under
+/data/misc/keystore/omk/data/soter/ with directory mode 0700 and file mode
+0600. identities.json stores public identity metadata and app policy. Each
+opaque identity ID names a private JSON ledger. Adding an identity is explicit;
+opening the dialog creates no files. No remote relay, imported factory private
+keys or application-preference clearing is part of this feature.
+
+The package picker's menu offers bulk identity assignment. It snapshots all
+checked installed package/user entries, including system apps, independently
+of the visible search results. The user selects an existing identity and
+confirms before one atomic policy write. Existing assignments and CPU-ID
+overrides are retained, and the SOTER master switch is unchanged. Missing
+identity, invalid target, or the 512-entry limit rejects the whole update.
+Unavailable packages and raw UID rules without a checked package row are not
+expanded into inferred app identities. A new package selection after opening
+the dialog is not included until the bulk dialog is reopened.
+
+Each identity has a Delete action with explicit confirmation. Deletion removes
+its private ledger (including keys and sessions) and all app assignments to that
+identity; those apps return to stock SOTER. Other identities and KeyMint Keybox
+data are unchanged. Deletion cannot be undone. Policy is revoked before the
+private ledger is unlinked; an unlink failure is reported and can be retried.
+
+Root helper commands are --webui-get-soter-local and
+--webui-set-soter-local-base64. The latter accepts a bounded Base64 JSON
+change: enabled, add, remove (identity ID), app, or apps (identity ID and target
+array, preserving existing assignments). Encoded management commands are
+bounded to 120 KiB. Master state, identity creation and app saves
+are independent changes serialized with the private directory lock.
+
 ## Local RKP Keybox issuance
 
 **Issue local RKP Keybox** is separate from **Fix RKP**. It generates a
@@ -1414,7 +1583,8 @@ V2 verifies the CSR/DICE signatures, structure, challenge and generated public
 key binding. V1 encrypted evidence can only be validated fully by the server.
 
 Every issuance requires a separate confirmation. The helper sends the real
-`ro.build.fingerprint`, generated public key and device RKP evidence only to
+`ro.build.fingerprint` (or an explicit per-issuance override), generated public
+key and device RKP evidence only to
 `https://remoteprovisioning.googleapis.com/v1:fetchEekChain` and
 `https://remoteprovisioning.googleapis.com/v1:signCertificates` over verified
 HTTPS. It never uploads the software private key. Redirects and automatic
@@ -1422,6 +1592,17 @@ signing retries are disabled. A timeout, malformed response or failed save
 after submission must not be treated as permission to retry blindly.
 Each network operation is bounded to 30 seconds and 256 KiB of response;
 each local bridge/worker is bounded to 30 seconds.
+
+**Include build fingerprint in signing request** is off by default. The
+effective fingerprint is always sent when fetching the challenge; this option
+also adds it as unverified metadata in the signing CSR. V1 places it in the
+unverified DeviceInfo map and V2 appends a fifth AuthenticatedRequest field.
+Signed and encrypted evidence retains its original bytes. Metadata is not
+covered by the hardware signature and must refer to the same firmware build
+as the device evidence's VBMeta digest. A per-issuance fingerprint override
+applies consistently to challenge fetching and all local protocol candidates.
+The choice never changes automatically after errors. Values are bounded to
+1024 UTF-8 bytes without control characters. These options are not persisted.
 
 Issued chains must match the generated key and pass certificate validity,
 issuer signature, CA/path-length/key-usage and pinned Google root checks.
@@ -1450,6 +1631,10 @@ keymint --webui-rkp-import <32-lowercase-hex-id> --confirm-replace
 ```
 
 The optional protocol argument accepts `auto`, `v1`, `v2`, or `v1-native`.
+Add `--include-fingerprint` to include unsigned CSR metadata, and optionally
+`--fingerprint-base64 <standard-base64-utf8>` to override the build fingerprint
+for this issuance. Without an override the current device property is read
+when issuing. The WebUI confirmation displays both choices before submission.
 Browser previews never execute these commands. Android arm64 is required;
 device and Google server acceptance must be tested on the actual firmware.
 The inherited V2 DICE validator recognizes Android 14, 15 and 16 profiles;

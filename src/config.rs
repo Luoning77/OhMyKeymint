@@ -938,8 +938,8 @@ pub struct MainConfig {
     #[serde(deserialize_with = "deserialize_ta_delay_range")]
     pub ta_control_delay_ms: [u16; 2],
     /// Insecure fallback for devices whose system TEE cannot verify HATs.
-    /// When enabled, OMK accepts shape-valid HATs without system KeyMint MAC verification.
-    #[serde(default)]
+    /// When enabled, direct fingerprint-only HATs skip system KeyMint MAC verification.
+    /// Password and combined token types still require verification; System mirrors are separate.
     pub force_skip_system_biometric_hat_verification: bool,
     /// Retire dedicated ATTEST_KEY entries bound to a previous keybox identity.
     /// Ordinary application keys and passkeys remain usable after a keybox change.
@@ -963,7 +963,7 @@ impl Default for MainConfig {
             ta_operation_delay_ms: [9, 21],
             ta_generation_delay_ms: [6, 16],
             ta_control_delay_ms: [1, 4],
-            force_skip_system_biometric_hat_verification: false,
+            force_skip_system_biometric_hat_verification: true,
             retire_stale_keybox_bound_keys: true,
         }
     }
@@ -1509,7 +1509,12 @@ force_skip_system_biometric_hat_verification = true"#,
         )
         .unwrap();
         assert!(parsed.force_skip_system_biometric_hat_verification);
-        assert!(!MainConfig::default().force_skip_system_biometric_hat_verification);
+        assert!(MainConfig::default().force_skip_system_biometric_hat_verification);
+        let omitted: MainConfig = toml::from_str(r#"backend = "injector""#).unwrap();
+        assert!(omitted.force_skip_system_biometric_hat_verification);
+        let explicit_false: MainConfig =
+            toml::from_str("force_skip_system_biometric_hat_verification = false").unwrap();
+        assert!(!explicit_false.force_skip_system_biometric_hat_verification);
     }
 
     #[test]

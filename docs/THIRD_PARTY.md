@@ -123,8 +123,9 @@ tool completion report, not proof of successful Google provisioning.
 
 The local RKP protocol, CBOR/DICE verification, native KeymasterUtils ABI and
 V1 Java bridge are adapted from
-[eltavine/Duck-ToolBox](https://github.com/eltavine/Duck-ToolBox/tree/8d6a2470b1033c35946b72bb1f9bc56d8947dd63)
-through revision `8d6a2470b1033c35946b72bb1f9bc56d8947dd63` (MIT).
+[eltavine/Duck-ToolBox](https://github.com/eltavine/Duck-ToolBox/tree/75f78866071287ecc749dcbbf53dbd2fc47b4e67)
+including optional CSR fingerprint metadata from
+`75f78866071287ecc749dcbbf53dbd2fc47b4e67` (MIT).
 Relevant upstream paths are `crates/duck-rkp-device/src/` and
 `crates/duck-rkp/src/{cbor,verify}`. The V1 PureSoft MAC/AIDL construction also
 derives from `LazyBonesLZY/rkp-v1-oracle` revision `b28480c` (MIT), as credited
@@ -142,6 +143,45 @@ bounded fixed-endpoint HTTP requests and strict issued-chain validation using
 OMK's existing Google root pins. It does not copy Duck's simulated-device
 issuance, seed/identity storage, arbitrary endpoint selection or automatic
 import behavior. The Java bridge contains no network or private-key logic.
+
+## SOTER local identities and CPU-ID overrides
+
+The EngineerMode gen_unique_id policy rule is adapted from Andrea-lyz/ommega
+commit 9583e028449f8d2c5cfef97f6f86d42aa840c738 (AGPL-3.0-or-later),
+by Yunzhe Liao / Andrea-lyz. It grants only the engineering app domain the
+existing unique-ID attestation permission; it does not bypass KeyMint checks.
+
+The native HAL hook and local state machine derive from Ommega
+(AGPL-3.0-or-later), including c6172dc553543aa8eea1b7e03cd50c2ff6f1efb1.
+The local random identity policy references Andrea-lyz/ommega commits
+4721358e and 55e7dec9, reviewed through
+9583e028 (master on November 5, 2026). Each local identity owns random CPU-ID
+and signing material. OMK uses its existing BoringSSL Rust interfaces.
+
+Per-application CPU-ID mapping and support for both 32 and 36 hex characters
+are adapted from the user-provided tricky-soter-service-1.9.2 source,
+soter/src/hook/soter_local.rs and soter/src/local_support.rs, under
+AGPL-3.0-or-later. OMK resolves package/user policy in the privileged broker,
+keeps new files in its private data directory, and does not copy the source's
+factory-key imports, C++ host, preference deletion or
+remote forwarding. Attribution is shipped in
+THIRD_PARTY_LICENSES/SOTER-local.txt.
+
+The app-local Oplus EngineerMode cryptoeng display hook references
+host/module.cpp in the same user-provided source (AGPL-3.0-or-later). OMK
+implements it in Rust inside the existing Zygisk payload, without a new
+companion protocol or native runtime component. It synthesizes the selected
+engineering display response only; it does not provision hardware keys.
+
+The optional app-local Java status bridge uses LSPlant (LGPL-3.0-or-later),
+revision 06bd3412d639d6b0d76fe6c7388066fe44e8963d, and its pinned DexBuilder
+and parallel-hashmap sources. The native inline backend is the upstream
+LSPlant test dependency io.github.vvb2060.ndk:dobby:1.2 (Apache-2.0), with
+org.lsposed.libcxx:libcxx:30.0.16248370 (Apache-2.0 WITH LLVM-exception).
+scripts/build_engineer_bridge.py pins source revisions and archive SHA-256
+digests. Dependencies are cached under target and are never fetched on-device.
+The generated callback and C++ glue only replace the selected engineering
+application's display result, not hardware-key state or attestation validation.
 
 ## Native HTTPS client
 

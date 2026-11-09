@@ -4,7 +4,6 @@ import type { ComponentPublicInstance, ComputedRef } from 'vue'
 import {
   MiuixButton,
   MiuixCard,
-  MiuixFloatingActionButton,
   MiuixIcon,
   MiuixIconButton,
   MiuixProgressIndicator,
@@ -21,13 +20,11 @@ import {
   Clear,
   Close,
   More,
-  Ok,
   Refresh,
   SelectAll,
 } from 'miuix-vue/icons'
 import {
   afterPaint,
-  parsePackageUserTarget,
   type AppList,
   type SelectableAppEntry,
 } from '../app_list/app_list'
@@ -35,13 +32,17 @@ import { type Cli } from '../cli'
 import { i18n } from '../i18n'
 import { isDev } from '../utils/dev'
 import TargetAppRow from './TargetAppRow.vue'
+import SoterIdentityDialog from './SoterIdentityDialog.vue'
 
 interface Props {
   appList: AppList
   cli: Cli
   loading?: boolean
   refreshing?: boolean
+  saving?: boolean
+  saveError?: boolean
   applyEnabled?: boolean
+  saveSelection: () => Promise<boolean>
 }
 
 interface SearchBarInstance extends ComponentPublicInstance {
@@ -51,12 +52,13 @@ interface SearchBarInstance extends ComponentPublicInstance {
 const props = withDefaults(defineProps<Props>(), {
   loading: false,
   refreshing: false,
+  saving: false,
+  saveError: false,
   applyEnabled: true,
 })
 
 const emit = defineEmits<{
   close: []
-  apply: []
   refresh: []
   'overlay-open': []
   'overlay-close': []
@@ -75,7 +77,6 @@ const menuOpen = ref(false)
 const selectingRecommended = ref(false)
 const systemSheetOpen = ref(false)
 const systemSearchQuery = ref('')
-const systemSelection = ref(new Set<string>())
 const searchBar = ref<SearchBarInstance | null>(null)
 const pullBody = ref<HTMLElement | null>(null)
 const pullIndicator = ref<HTMLElement | null>(null)
@@ -86,6 +87,26 @@ const autoEnabled = ref(false)
 const autoStatus = ref<'loading' | 'ready' | 'error'>('loading')
 const autoBusy = ref(false)
 const autoError = ref('')
+const identityOpen = ref(false)
+const identityTarget = ref('')
+const identityBatchTargets = ref<string[] | undefined>()
+const identityDialog = ref<InstanceType<typeof SoterIdentityDialog> | null>(null)
+function openIdentity(entry: SelectableAppEntry): void {
+  if (props.loading || props.saving || props.saveError) return
+  systemSheetOpen.value = false
+  menuOpen.value = false
+  identityTarget.value = entry.targetKey
+  identityBatchTargets.value = undefined
+  identityOpen.value = true
+}
+
+function openBulkIdentity(): void {
+  if (props.loading || props.saving || props.saveError || selectingRecommended.value) return
+  identityTarget.value = ''
+  identityBatchTargets.value = props.appList.getSelectedIdentityTargets()
+  menuOpen.value = false
+  identityOpen.value = true
+}
 let disposed = false
 
 async function loadAutoTargets(): Promise<void> {
@@ -168,7 +189,7 @@ function resetPull(): void {
 }
 
 function startPull(event: TouchEvent): void {
-  if (props.loading || selectingRecommended.value || menuOpen.value || systemSheetOpen.value
+  if (props.loading || props.saving || selectingRecommended.value || menuOpen.value || systemSheetOpen.value
       || event.touches.length !== 1 || pageScroller.scrollTop > 0
       || (event.target instanceof Element && event.target.closest('input, button, [role="switch"]'))) {
     if (pullStart) resetPull()
@@ -225,7 +246,7 @@ function movePull(event: TouchEvent): void {
 function finishPull(event: TouchEvent): void {
   if (!pullStart) return
   // Use the latest logical distance even if its animation frame has not run.
-  const ready = pullCaptured && pullDistance >= PULL_REFRESH_DISTANCE
+  const ready = !props.saving && pullCaptured && pullDistance >= PULL_REFRESH_DISTANCE
   if (pullCaptured && event.cancelable) event.preventDefault()
   settlePull(ready ? PULL_REFRESH_OFFSET : 0)
   if (ready) refresh()
@@ -236,7 +257,7 @@ watch(() => props.refreshing, refreshing => {
 })
 // A menu followed by the system sheet is one overlay in the parent's history.
 // Watching the combined state also avoids closing a second layer on Android Back.
-watch(() => menuOpen.value || systemSheetOpen.value, open => {
+watch(() => menuOpen.value || systemSheetOpen.value || identityOpen.value, open => {
   if (open) emit('overlay-open')
   else emit('overlay-close')
 })
@@ -311,16 +332,18 @@ const renderedSystemEntries = batchedEntries(
 )
 
 function setSelected(entry: SelectableAppEntry, selected: boolean): void {
-  if (props.loading || menuOpen.value || selectingRecommended.value) return
+  if (props.loading || !props.applyEnabled || menuOpen.value || selectingRecommended.value) return
   props.appList.setTargetSelected(entry, selected)
+  void props.saveSelection()
 }
 
 async function selectRecommended(): Promise<void> {
-  if (props.loading || selectingRecommended.value) return
+  if (props.loading || !props.applyEnabled || selectingRecommended.value) return
   selectingRecommended.value = true
   try {
     await props.appList.selectRecommended()
     menuOpen.value = false
+    await props.saveSelection()
   } catch (error) {
     console.error('Unable to select recommended apps:', error)
     void showSnackbar({
@@ -334,18 +357,16 @@ async function selectRecommended(): Promise<void> {
 }
 
 function deselectAll(): void {
+  if (props.loading || !props.applyEnabled || selectingRecommended.value) return
   menuOpen.value = false
   props.appList.deselectAll()
+  void props.saveSelection()
 }
 
 function refresh(): void {
-  if (props.loading || selectingRecommended.value) return
+  if (props.loading || props.saving || selectingRecommended.value) return
   menuOpen.value = false
   emit('refresh')
-}
-
-function apply(): void {
-  if (!props.loading && !selectingRecommended.value && props.applyEnabled) emit('apply')
 }
 
 function focusSearch(): void {
@@ -356,37 +377,10 @@ function focusSearch(): void {
 }
 
 function openSystemApps(): void {
+  if (props.loading || !props.applyEnabled || selectingRecommended.value) return
   menuOpen.value = false
   systemSearchQuery.value = ''
-  // Retain bare all-user rules and unmapped selectors instead of converting
-  // them to the currently visible profile list when the sheet is opened.
-  systemSelection.value = new Set(props.appList.getSelectedPackages())
   systemSheetOpen.value = true
-}
-
-function setSystemSelected(targetKey: string, selected: boolean): void {
-  const target = parsePackageUserTarget(targetKey)
-  if (target === null) return
-  const nextSelection = new Set(systemSelection.value)
-  if (selected) {
-    if (!nextSelection.has(target.packageName)) nextSelection.add(target.targetKey)
-  } else {
-    nextSelection.delete(target.targetKey)
-    if (nextSelection.delete(target.packageName)) {
-      for (const entry of props.appList.getSystemEntries()) {
-        if (entry.packageName === target.packageName && entry.userId !== target.userId) {
-          nextSelection.add(entry.targetKey)
-        }
-      }
-    }
-  }
-  systemSelection.value = nextSelection
-}
-
-function saveSystemApps(): void {
-  if (props.loading) return
-  props.appList.applySystemAppSelection([...systemSelection.value])
-  systemSheetOpen.value = false
 }
 
 function closeSystemApps(): void {
@@ -394,6 +388,7 @@ function closeSystemApps(): void {
 }
 
 function dismissOverlay(): boolean {
+  if (identityOpen.value) { identityDialog.value?.requestClose(); return true }
   if (systemSheetOpen.value) {
     closeSystemApps()
     return true
@@ -416,7 +411,6 @@ defineExpose({
   selectRecommended,
   deselectAll,
   refresh,
-  apply,
   openSystemApps,
   dismissOverlay,
 })
@@ -462,7 +456,7 @@ defineExpose({
 
             <Transition name="targets-menu">
               <MiuixCard v-if="menuOpen" class="targets-menu-popup" role="menu">
-                <MiuixButton role="menuitem" :disabled="loading || selectingRecommended" @click="selectRecommended">
+                <MiuixButton role="menuitem" :disabled="loading || selectingRecommended || !applyEnabled" @click="selectRecommended">
                   <MiuixProgressIndicator v-if="selectingRecommended" type="circular" :size="21" />
                   <MiuixIcon v-else :icon="SelectAll" :size="21" />
                   <span class="targets-menu-label">
@@ -470,17 +464,21 @@ defineExpose({
                     <small>{{ translate('menu_select_recommended_desc', 'User apps and Google services; skip recognized Root, Shizuku and Xposed tools. Keep existing selections.') }}</small>
                   </span>
                 </MiuixButton>
-                <MiuixButton role="menuitem" :disabled="selectingRecommended" @click="deselectAll">
+                <MiuixButton role="menuitem" :disabled="loading || selectingRecommended || !applyEnabled" @click="deselectAll">
                   <MiuixIcon :icon="Clear" :size="21" />
                   <span>{{ translate('menu_deselect_all', 'Deselect all') }}</span>
                 </MiuixButton>
-                <MiuixButton role="menuitem" :disabled="loading || selectingRecommended" @click="refresh">
+                <MiuixButton role="menuitem" :disabled="loading || saving || selectingRecommended" @click="refresh">
                   <MiuixIcon :icon="Refresh" :size="21" />
                   <span>{{ translate('menu_refresh', 'Refresh') }}</span>
                 </MiuixButton>
-                <MiuixButton role="menuitem" :disabled="loading || selectingRecommended" @click="openSystemApps">
+                <MiuixButton role="menuitem" :disabled="loading || selectingRecommended || !applyEnabled" @click="openSystemApps">
                   <MiuixIcon :icon="AddCircle" :size="21" />
                   <span>{{ translate('menu_add_system_app', 'Add System App') }}</span>
+                </MiuixButton>
+                <MiuixButton role="menuitem" :disabled="loading || saving || saveError || selectingRecommended" @click="openBulkIdentity">
+                  <MiuixIcon :icon="AddCircle" :size="21" />
+                  <span>{{ translate('soter_bulk_title', 'Assign local identity to selected apps') }}</span>
                 </MiuixButton>
               </MiuixCard>
             </Transition>
@@ -535,6 +533,12 @@ defineExpose({
           <MiuixButton v-if="autoStatus === 'error'" @click="loadAutoTargets">{{ translate('functional_button_retry', 'Retry') }}</MiuixButton>
         </div>
       </MiuixCard>
+      <div v-if="saving || saveError" class="targets-auto-state" :role="saveError ? 'alert' : 'status'">
+        <MiuixProgressIndicator v-if="saving" type="circular" :size="18" />
+        <span>{{ translate(saveError ? 'app_targets_save_failed' : 'app_targets_saving',
+          saveError ? 'Selections are not saved. Retry to apply them.' : 'Saving selections…') }}</span>
+        <MiuixButton v-if="saveError" @click="saveSelection">{{ translate('functional_button_retry', 'Retry') }}</MiuixButton>
+      </div>
       <div v-if="initialLoading" class="targets-loading" role="status">
         <MiuixProgressIndicator type="circular" :size="34" />
         <span class="sr-only">{{ translate('home_status_loading', 'Checking') }}</span>
@@ -552,10 +556,11 @@ defineExpose({
             </h3>
             <TargetAppRow
               :selected="true"
-              :disabled="loading || selectingRecommended"
+              :disabled="loading || selectingRecommended || !applyEnabled"
               :app-name="entry.appName"
               :package-name="entry.packageName"
               @select="setSelected(entry, $event)"
+              @settings="openIdentity(entry)"
             />
           </template>
         </section>
@@ -570,10 +575,11 @@ defineExpose({
             </h3>
             <TargetAppRow
               :selected="false"
-              :disabled="loading || selectingRecommended"
+              :disabled="loading || selectingRecommended || !applyEnabled"
               :app-name="entry.appName"
               :package-name="entry.packageName"
               @select="setSelected(entry, $event)"
+              @settings="openIdentity(entry)"
             />
           </template>
         </section>
@@ -590,23 +596,6 @@ defineExpose({
       </div>
     </main>
 
-    <MiuixFloatingActionButton
-      v-show="!systemSheetOpen"
-      class="targets-apply"
-      :disabled="loading || selectingRecommended || !applyEnabled"
-      :aria-label="translate('functional_button_apply', 'Apply')"
-      :title="translate('functional_button_apply', 'Apply')"
-      @click="apply"
-    >
-      <MiuixProgressIndicator
-        v-if="loading && !refreshing"
-        type="circular"
-        :size="27"
-        :stroke-width="3"
-      />
-      <MiuixIcon v-else :icon="Ok" />
-    </MiuixFloatingActionButton>
-
     <MiuixBottomSheet
       v-model="systemSheetOpen"
       :title="translate('add_system_app_title', 'Add System App')"
@@ -619,13 +608,13 @@ defineExpose({
           <MiuixIcon :icon="Close" />
         </MiuixIconButton>
       </template>
-      <template #end-action>
-        <MiuixButton type="primary" :disabled="loading" @click="saveSystemApps">
-          {{ translate('functional_button_save', 'Save') }}
-        </MiuixButton>
-      </template>
-
       <div class="system-app-sheet">
+        <div v-if="saving || saveError" class="targets-auto-state" :role="saveError ? 'alert' : 'status'">
+          <MiuixProgressIndicator v-if="saving" type="circular" :size="18" />
+          <span>{{ translate(saveError ? 'app_targets_save_failed' : 'app_targets_saving',
+            saveError ? 'Selections are not saved. Retry to apply them.' : 'Saving selections…') }}</span>
+          <MiuixButton v-if="saveError" @click="saveSelection">{{ translate('functional_button_retry', 'Retry') }}</MiuixButton>
+        </div>
         <MiuixSearchBar
           v-model="systemSearchQuery"
           :label="translate('search_bar_search_placeholder', 'Search')"
@@ -642,11 +631,12 @@ defineExpose({
             {{ translate('app_target_user', 'User') }} {{ entry.userId }}<span v-if="entry.currentUser"> · {{ translate('app_target_current_user', 'Current') }}</span>
           </h3>
           <TargetAppRow
-            :selected="systemSelection.has(entry.targetKey) || systemSelection.has(entry.packageName)"
-            :disabled="loading"
+            :selected="entry.selected"
+            :disabled="loading || !applyEnabled"
             :app-name="entry.appName"
             :package-name="entry.packageName"
-            @select="setSystemSelected(entry.targetKey, $event)"
+            @select="setSelected(entry, $event)"
+            @settings="openIdentity(entry)"
           />
           </template>
           <div v-if="renderedSystemEntries.length < systemEntries.length" class="app-list-batch-loading" role="status">
@@ -662,6 +652,8 @@ defineExpose({
       </div>
     </MiuixBottomSheet>
 
+    <SoterIdentityDialog ref="identityDialog" v-model="identityOpen" :cli="cli" :target="identityTarget"
+      :batch-targets="identityBatchTargets" />
   </section>
 </template>
 
@@ -976,18 +968,6 @@ defineExpose({
 .targets-empty p {
   margin: 0;
   font-size: 15px;
-}
-
-.targets-apply {
-  position: fixed;
-  z-index: 30;
-  right: calc(20px + var(--omk-right-inset) / var(--omk-ui-scale));
-  bottom: calc(14px + var(--omk-bottom-inset) / var(--omk-ui-scale));
-}
-
-[dir='rtl'] .targets-apply {
-  right: auto;
-  left: calc(20px + var(--omk-left-inset) / var(--omk-ui-scale));
 }
 
 .system-app-sheet {
